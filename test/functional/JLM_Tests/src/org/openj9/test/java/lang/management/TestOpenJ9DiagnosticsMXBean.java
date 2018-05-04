@@ -37,7 +37,7 @@ import java.lang.management.ManagementFactory;
 import java.net.MalformedURLException;
 import java.util.ArrayList;
 import java.util.List;
-
+import java.util.Random;
 import javax.management.JMX;
 import javax.management.MBeanServer;
 import javax.management.MBeanServerConnection;
@@ -59,6 +59,7 @@ import openj9.lang.management.*;
 @Test(groups = { "level.extended" })
 public class TestOpenJ9DiagnosticsMXBean {
 	private static Logger logger = Logger.getLogger(TestOpenJ9DiagnosticsMXBean.class);
+	private static String os = System.getProperty("os.name");
 	private static Process remoteServer;
 	private static Watchdog watchdog;
 	private ObjectName mxbeanName = null;
@@ -263,10 +264,30 @@ public class TestOpenJ9DiagnosticsMXBean {
 			e.printStackTrace();
 		}		
 
+		dumpFileName = "javacore_unsupported.txt";
+		dumpFilePath = dir + File.separator + dumpFileName;
+		int counter = 1;
+		while(true) {
+			try {
+				Thread.sleep(100);
+				diagBean.setDumpOptions("java:events=catch,filter=java/io/UnsupportedEncodingException,range=1..1,file=" + dumpFilePath);
+				break;
+			} catch (ConfigurationUnavailableException e) {
+				// Ignore exception and try setting options again
+			} catch (InvalidOptionException e) {
+				e.printStackTrace();
+                                Assert.fail("Unexpected exception thrown: " + e.getMessage());
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+				Assert.fail("Exception occurred while sleeping thread: " + e.getMessage());
+			}
+			if (counter == 20) {
+				break;
+			} 
+			counter++;
+		}
+
 		try {
-			dumpFileName = "javacore_unsupported.txt";
-			dumpFilePath = dir + File.separator + dumpFileName;
-			diagBean.setDumpOptions("java:events=catch,filter=java/io/UnsupportedEncodingException,range=1..1,file=" + dumpFilePath);
 			new String("hello").getBytes("Unsupported");
 		} catch (UnsupportedEncodingException e) {
 			/* Received the expected UnsupportedEncodingException */
@@ -406,8 +427,12 @@ public class TestOpenJ9DiagnosticsMXBean {
 			try {
 				diagBean.triggerDump(agent);
 				if (!(agent.equals("stack"))) {
-					found = findAndDeleteFile(".", files[index]);
-					Assert.assertTrue(found, files[index] + " not found");
+					if (isZOSSystemAgent(agent)) {
+						/* checking for dataset presence will be included later */
+					} else {
+						found = findAndDeleteFile(".", files[index]);
+						Assert.assertTrue(found, files[index] + " not found");
+					}
 				}
 			} catch (java.lang.IllegalArgumentException e) {
 				/* stack agent is not supported by the trigger method */
@@ -437,15 +462,24 @@ public class TestOpenJ9DiagnosticsMXBean {
 		int index = 0;
 		String dir = "." + File.separator + test + "_dumps";
 
+
 		for (String agent : dumpAgents) {
 			try {
 				String filePath = dir + File.separator + files[index];
+				if (isZOSSystemAgent(agent)) {
+					filePath = "%uid.MYJVM.%job.D%y%m%d.T%H%M%S";
+				}
+				
 				String fileName = diagBean.triggerDumpToFile(agent, filePath);
 				File dumpFile = new File(fileName);
 
 				if (!(agent.equals("stack"))) {
-					found = findAndDeleteFile(dir, dumpFile.getName());
-					Assert.assertTrue(found, fileName + " not found");
+					if (isZOSSystemAgent(agent)) {
+						/* checking for dataset presence will be included later */
+					} else {
+						found = findAndDeleteFile(dir, dumpFile.getName());
+						Assert.assertTrue(found, fileName + " not found");
+					}
 				} 
 			} catch (java.lang.IllegalArgumentException e) {
 				/* stack agent is not supported by the trigger method */
@@ -536,29 +570,76 @@ public class TestOpenJ9DiagnosticsMXBean {
 	}
 
 	/**
+	 * Function to check if it is zOS and system dump agent.
+	 *
+	 * @param agent Indicates the dump agent.
+	 * @return a boolean indicating if it is zOS and system dump agent
+	 */
+	private static boolean isZOSSystemAgent(String agent) {
+		if ("z/OS".equalsIgnoreCase(os) && "system".equals(agent)) {
+			return true;
+		} else {
+			return false;
+		}
+	}
+
+	/**
 	 * Internal function: Starts a remote server to connect to.
 	 */
 	private static void startRemoteServer() {
-		logger.info("Start Remote Server!");
-		String classpath = System.getProperty("java.class.path");
-		String javaExec = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java";
+		logger.info("Starting Remote Server to Monitor!");
 
-		try {
-			ProcessBuilder builder = new ProcessBuilder(javaExec, "-Xdump:dynamic", "-classpath", classpath, "-Dcom.sun.management.jmxremote.port=9999", 
-									"-Dcom.sun.management.jmxremote.authenticate=false", 
-									"-Dcom.sun.management.jmxremote.ssl=false", RemoteProcess.class.getName());
+                char fs = File.separatorChar;
 
+                /* Set up a randomly named file and pass this to child process. Parent keeps checking
+                 * for its existence on the file-system. When this goes missing, it implies the child
+                 * process is up and running.
+                 */
+                Random randomGenerator = new Random();
+                String tmpName = System.getProperty("java.io.tmpdir") + fs + randomGenerator.nextInt(10000) + ".lock";
+
+                String classpath = System.getProperty("java.class.path");
+                String jmxremoteOptions = System.getProperty("remote.server.option");
+                String javaExec = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java";
+
+                List<String> processArgs = new ArrayList<String>();
+                processArgs.add(javaExec);
+                processArgs.add("-Xdump:dynamic");
+                processArgs.add("-classpath");
+                processArgs.add(classpath);
+
+                Assert.assertNotNull(jmxremoteOptions, "-Dremote.server.option was null, JMX remote properties have to be specified");
+                String[] options = jmxremoteOptions.trim().split("\\s+");
+                for (String opt : options) {
+                        processArgs.add(opt);
+                }
+                processArgs.add("-Djava.lock.file=" + tmpName);
+                processArgs.add(RemoteProcess.class.getName());
+
+                try {
+                        ProcessBuilder builder = new ProcessBuilder(processArgs);
+                        logger.info("ProcessBuilder command " + builder.command());
 			remoteServer = builder.start();
 		} catch (IOException e) {
 			e.printStackTrace();
 			Assert.fail("Failed to launch child process " + remoteServer);
 		}
 
-		try {
-			Thread.sleep(10);
-		} catch (InterruptedException e) {
-			e.printStackTrace();
-		}
+		BufferedReader in = new BufferedReader( new InputStreamReader(remoteServer.getInputStream()));
+                String rSrvStdout;
+                try {
+                        if ((rSrvStdout = in.readLine()) != null) {
+                                logger.info("Remote Server stdout: " + rSrvStdout);
+                        }
+                } catch (IOException e) {
+                        Assert.fail("Exception occurred while waiting for server.", e);
+                }
+
+                try {
+                        Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                        logger.warn("InterruptedException occured" + e.getMessage(), e);
+                }
 	} 
 
 	/**

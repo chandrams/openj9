@@ -34,7 +34,7 @@ public class RemoteProcess {
 	 */
 	public static void main(String[] args) {
 		System.out.println("=========RemoteProcess Starts!=========");
-		for (int i = 0; i < 60; i++) {
+		while (true) {
 			try {
 				int[] a = new int[1024 * 1024];
 				new String("hello").getBytes("Unsupported");
@@ -55,6 +55,5 @@ public class RemoteProcess {
 				e.printStackTrace();
 			}
 		}
-		System.out.println("RemoteProcess Stops!");
 	}
 }
